@@ -306,7 +306,9 @@ class GCG:
             if config.use_prefix_cache:
                 with torch.no_grad():
                     output = model(inputs_embeds=before_embeds, use_cache=True)
-                    prompt_data["prefix_cache"] = DynamicCache.from_legacy_cache(output.past_key_values)
+                    prompt_data["prefix_cache"] = DynamicCache.from_legacy_cache(
+                        output.past_key_values
+                    )
 
             # Handle draft model for probe sampling
             if config.probe_sampling_config:
@@ -349,7 +351,9 @@ class GCG:
                         output = self.draft_model(
                             inputs_embeds=draft_before_embeds, use_cache=True
                         )
-                        prompt_data["draft_prefix_cache"] = DynamicCache.from_legacy_cache(output.past_key_values)
+                        prompt_data["draft_prefix_cache"] = (
+                            DynamicCache.from_legacy_cache(output.past_key_values)
+                        )
 
             self.prompt_data.append(prompt_data)
 
@@ -515,7 +519,9 @@ class GCG:
         tokenizer = self.tokenizer
         config = self.config
 
-        logger.info(f"Initializing multi-prompt attack buffer of size {config.buffer_size}...")
+        logger.info(
+            f"Initializing multi-prompt attack buffer of size {config.buffer_size}..."
+        )
 
         # Create the attack buffer and initialize the buffer ids
         buffer = AttackBuffer(config.buffer_size)
@@ -758,7 +764,7 @@ class GCG:
                             prefix_cache_batch.update(
                                 key.expand(current_batch_size, -1, -1, -1),
                                 value.expand(current_batch_size, -1, -1, -1),
-                                layer_idx
+                                layer_idx,
                             )
 
                     outputs = self.model(
@@ -824,7 +830,9 @@ class GCG:
 
         # Debug: Check if we have valid inputs
         if sampled_ids.shape[0] == 0:
-            logger.warning(f"Empty sampled_ids tensor passed to _compute_candidates_loss_original_multi_prompt")
+            logger.warning(
+                f"Empty sampled_ids tensor passed to _compute_candidates_loss_original_multi_prompt"
+            )
             return torch.tensor([], device=sampled_ids.device, dtype=torch.float32)
 
         for i in range(0, sampled_ids.shape[0], search_batch_size):
@@ -857,7 +865,7 @@ class GCG:
                             prefix_cache_batch.update(
                                 key.expand(current_batch_size, -1, -1, -1),
                                 value.expand(current_batch_size, -1, -1, -1),
-                                layer_idx
+                                layer_idx,
                             )
                         outputs = self.model(
                             inputs_embeds=input_embeds_batch,
@@ -993,7 +1001,7 @@ class GCG:
                                 draft_prefix_cache_batch.update(
                                     key.expand(batch_size, -1, -1, -1),
                                     value.expand(batch_size, -1, -1, -1),
-                                    layer_idx
+                                    layer_idx,
                                 )
                         draft_embeds = torch.cat(
                             [
@@ -1145,7 +1153,9 @@ class GCG:
         assert probe_sampling_config, "Probe sampling config wasn't set up properly."
 
         B = sampled_ids.shape[0]
-        probe_size = max(1, B // probe_sampling_config.sampling_factor)  # Ensure at least 1
+        probe_size = max(
+            1, B // probe_sampling_config.sampling_factor
+        )  # Ensure at least 1
         probe_idxs = torch.randperm(B)[:probe_size].to(sampled_ids.device)
 
         def _compute_probe_losses_multi_prompt(
@@ -1177,12 +1187,16 @@ class GCG:
                         draft_prefix_cache_batch = None
                         if prompt_data.get("draft_prefix_cache"):
                             draft_prefix_cache_batch = DynamicCache()
-                            for layer_idx in range(len(prompt_data["draft_prefix_cache"])):
-                                key, value = prompt_data["draft_prefix_cache"][layer_idx]
+                            for layer_idx in range(
+                                len(prompt_data["draft_prefix_cache"])
+                            ):
+                                key, value = prompt_data["draft_prefix_cache"][
+                                    layer_idx
+                                ]
                                 draft_prefix_cache_batch.update(
                                     key.expand(batch_size, -1, -1, -1),
                                     value.expand(batch_size, -1, -1, -1),
-                                    layer_idx
+                                    layer_idx,
                                 )
                             draft_embeds = torch.cat(
                                 [
@@ -1336,7 +1350,7 @@ class GCG:
 
 
 # A wrapper around the GCG `run` method that provides a simple API
-def run(
+def run_nanogcg(
     model: transformers.PreTrainedModel,
     tokenizer: transformers.PreTrainedTokenizer,
     messages_and_targets: List[Tuple[Union[str, List[dict]], str]],

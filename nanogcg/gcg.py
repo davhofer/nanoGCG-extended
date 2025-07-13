@@ -271,7 +271,17 @@ class GCG:
             # Remove the BOS token -- this will get added when tokenizing, if necessary
             if tokenizer.bos_token and template.startswith(tokenizer.bos_token):
                 template = template.replace(tokenizer.bos_token, "")
-            before_str, after_str = template.split("{optim_str}")
+            # Handle multiple {optim_str} occurrences by using only the first one
+            parts = template.split("{optim_str}")
+            if len(parts) < 2:
+                raise ValueError("No {optim_str} placeholder found in template")
+            elif len(parts) == 2:
+                before_str, after_str = parts
+            else:
+                # Multiple {optim_str} - use first occurrence and rejoin the rest
+                before_str = parts[0]
+                after_str = "{optim_str}".join(parts[1:])
+                print(f"Warning: Multiple {{optim_str}} placeholders found, using first occurrence")
 
             target = " " + target if config.add_space_before_target else target
 

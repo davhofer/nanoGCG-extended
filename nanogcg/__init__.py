@@ -1,7 +1,7 @@
 """
 The nanogcg package provides a simple interface for running the GCG algorithm on causal Hugging Face language models.
 
-Example usage: 
+Example usage:
 
 ```
 model_id = "mistralai/Mistral-7B-Instruct-v0.2"
@@ -15,4 +15,5 @@ result = nanogcg.run(model, tokenizer, message, target)
 For more detailed information, see the GitHub repository: https://github.com/GraySwanAI/nanoGCG/tree/main
 """
 
-from .gcg import GCGConfig, ProbeSamplingConfig, run
+from .gcg import GCGConfig, ProbeSamplingConfig, run_nanogcg
+

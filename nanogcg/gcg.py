@@ -249,41 +249,85 @@ class GCG:
                 "{% for message in messages %}{{ message['content'] }}{% endfor %}"
             )
 
-        # Initialize profiling
-        self.profiler = None
-        if config.enable_profiling:
-            self._init_profiling()
-
-    def _init_profiling(self):
-        """Initialize the torch profiler for Chrome/Perfetto trace output."""
+    def _setup_profiler(self):
+        """Initialize and return the torch profiler for Chrome/Perfetto trace output."""
         # Create output directory if it doesn't exist
         os.makedirs(self.config.profiling_output_dir, exist_ok=True)
-        
+
         # Determine activities based on device
         activities = [ProfilerActivity.CPU]
         if self.model.device.type == "cuda":
             activities.append(ProfilerActivity.CUDA)
-        
-        self.profiler = profile(
+
+        logger.info(
+            f"Profiling enabled. Chrome traces will be saved to {self.config.profiling_output_dir}"
+        )
+        logger.info("View traces at: chrome://tracing/ or https://ui.perfetto.dev/")
+
+        return profile(
             activities=activities,
             record_shapes=True,
             profile_memory=True,
-            with_stack=True
+            with_stack=True,
         )
-        
-        logger.info(f"Profiling enabled. Chrome traces will be saved to {self.config.profiling_output_dir}")
-        logger.info("View traces at: chrome://tracing/ or https://ui.perfetto.dev/")
 
-    def _save_profiling_results(self):
-        """Save profiling trace for Chrome/Perfetto visualization."""
-        if not self.profiler:
-            return
-            
-        trace_file = os.path.join(self.config.profiling_output_dir, "nanogcg_trace.json")
-        
-        self.profiler.export_chrome_trace(trace_file)
-        logger.info(f"Profiling trace saved to: {trace_file}")
-        logger.info("View at: chrome://tracing/ or https://ui.perfetto.dev/")
+    def _optimization_loop(
+        self, config, buffer, optim_ids, losses, optim_strings, tokenizer
+    ):
+        """Run the main GCG optimization loop."""
+        for step in tqdm(range(config.num_steps)):
+            # Compute the token gradient across all prompts
+            optim_ids_onehot_grad = self.compute_token_gradient(optim_ids)
+
+            with torch.no_grad():
+                # Sample candidate token sequences based on the token gradient
+                sampled_ids = sample_ids_from_grad(
+                    optim_ids.squeeze(0),
+                    optim_ids_onehot_grad.squeeze(0),
+                    config.search_width,
+                    config.topk,
+                    config.n_replace,
+                    not_allowed_ids=self.not_allowed_ids,
+                )
+
+                if config.filter_ids:
+                    sampled_ids = filter_ids(sampled_ids, tokenizer)
+
+                new_search_width = sampled_ids.shape[0]
+
+                # Compute loss on all candidate sequences across all prompts
+                batch_size = (
+                    new_search_width if config.batch_size is None else config.batch_size
+                )
+
+                # Choose evaluation method based on config
+                if config.use_autoregressive_loss:
+                    loss = find_executable_batch_size(
+                        self._compute_candidates_loss_autoregressive, batch_size
+                    )(sampled_ids)
+                else:
+                    loss = find_executable_batch_size(
+                        self._compute_candidates_loss, batch_size
+                    )(sampled_ids)
+                current_loss = loss.min().item()
+                optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
+
+                # Update the buffer based on the loss
+                losses.append(current_loss)
+                if buffer.size == 0 or current_loss < buffer.get_highest_loss():
+                    buffer.add(current_loss, optim_ids)
+
+            optim_ids = buffer.get_best_ids()
+            optim_str = tokenizer.batch_decode(optim_ids)[0]
+            optim_strings.append(optim_str)
+
+            buffer.log_buffer(tokenizer)
+
+            if self.stop_flag:
+                logger.info(
+                    f"Early stopping triggered  (Config: {self.config.early_stop})"
+                )
+                break
 
     def run(
         self,
@@ -376,70 +420,23 @@ class GCG:
         losses = []
         optim_strings = []
 
-        # Start profiling if enabled
-        if config.enable_profiling and self.profiler:
-            self.profiler.start()
-            logger.info("Started profiling...")
-
-        for step in tqdm(range(config.num_steps)):
-            # Compute the token gradient across all prompts
-            optim_ids_onehot_grad = self.compute_token_gradient(optim_ids)
-
-            with torch.no_grad():
-                # Sample candidate token sequences based on the token gradient
-                sampled_ids = sample_ids_from_grad(
-                    optim_ids.squeeze(0),
-                    optim_ids_onehot_grad.squeeze(0),
-                    config.search_width,
-                    config.topk,
-                    config.n_replace,
-                    not_allowed_ids=self.not_allowed_ids,
+        # Run optimization loop with or without profiling
+        if config.enable_profiling:
+            profiler = self._setup_profiler()
+            with profiler:
+                self._optimization_loop(
+                    config, buffer, optim_ids, losses, optim_strings, tokenizer
                 )
 
-                if config.filter_ids:
-                    sampled_ids = filter_ids(sampled_ids, tokenizer)
-
-                new_search_width = sampled_ids.shape[0]
-
-                # Compute loss on all candidate sequences across all prompts
-                batch_size = (
-                    new_search_width if config.batch_size is None else config.batch_size
-                )
-
-                # Choose evaluation method based on config
-                if config.use_autoregressive_loss:
-                    loss = find_executable_batch_size(
-                        self._compute_candidates_loss_autoregressive, batch_size
-                    )(sampled_ids)
-                else:
-                    loss = find_executable_batch_size(
-                        self._compute_candidates_loss, batch_size
-                    )(sampled_ids)
-                current_loss = loss.min().item()
-                optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
-
-                # Update the buffer based on the loss
-                losses.append(current_loss)
-                if buffer.size == 0 or current_loss < buffer.get_highest_loss():
-                    buffer.add(current_loss, optim_ids)
-
-            optim_ids = buffer.get_best_ids()
-            optim_str = tokenizer.batch_decode(optim_ids)[0]
-            optim_strings.append(optim_str)
-
-            buffer.log_buffer(tokenizer)
-
-            if self.stop_flag:
-                logger.info(
-                    f"Early stopping triggered  (Config: {self.config.early_stop})"
-                )
-                break
-
-        # Stop profiling and save results
-        if config.enable_profiling and self.profiler:
-            self.profiler.stop()
-            logger.info("Stopped profiling. Analyzing results...")
-            self._save_profiling_results()
+            # Save profiling results after context manager exits
+            trace_file = os.path.join(config.profiling_output_dir, "nanogcg_trace.json")
+            profiler.export_chrome_trace(trace_file)
+            logger.info(f"Profiling trace saved to: {trace_file}")
+            logger.info("View at: chrome://tracing/ or https://ui.perfetto.dev/")
+        else:
+            self._optimization_loop(
+                config, buffer, optim_ids, losses, optim_strings, tokenizer
+            )
 
         min_loss_index = losses.index(min(losses))
 

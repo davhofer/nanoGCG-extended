@@ -1,10 +1,9 @@
 import copy
 import gc
 import logging
-import queue
-import threading
 
 from dataclasses import dataclass
+from enum import Enum
 from tqdm import tqdm
 from typing import List, Optional, Tuple, Union
 
@@ -12,11 +11,9 @@ import torch
 import transformers
 from torch import Tensor
 from transformers import set_seed, DynamicCache
-from scipy.stats import spearmanr
 
 from nanogcg.utils import (
     INIT_CHARS,
-    configure_pad_token,
     find_executable_batch_size,
     get_nonascii_toks,
     mellowmax,
@@ -34,6 +31,26 @@ if not logger.hasHandlers():
     logger.setLevel(logging.INFO)
 
 
+class ESMetric(Enum):
+    MATCH = 1
+    LOSS = 2
+
+
+class ESCondition(Enum):
+    ALL = 1
+    ANY = 2
+    FRACTION = 3
+
+
+@dataclass
+class EarlyStoppingConfig:
+    enabled: bool = True
+    metric: ESMetric = ESMetric.MATCH  # Stop early if output string (argmax of logits) is a perfect match or if loss is low
+    condition: ESCondition = (
+        ESCondition.ALL
+    )  # Stop early if all, any, or a fraction of samples fulfill the criterion
+    fraction: float = 0.5  # used with ESCondition.FRACTION. fraction of samples that needs to fulfill the criterion to stop early
+    loss_threshold: float = 0.001
 
 
 @dataclass
@@ -47,13 +64,15 @@ class GCGConfig:
     buffer_size: int = 0
     use_mellowmax: bool = False
     mellowmax_alpha: float = 1.0
-    early_stop: bool = False
+    early_stop: EarlyStoppingConfig = EarlyStoppingConfig()
     use_prefix_cache: bool = True
     allow_non_ascii: bool = False
     filter_ids: bool = True
     add_space_before_target: bool = False
+    use_autoregressive_loss: bool = False
     seed: int = None
     verbosity: str = "INFO"
+    debug: bool = False
 
 
 @dataclass
@@ -341,9 +360,15 @@ class GCG:
                     new_search_width if config.batch_size is None else config.batch_size
                 )
 
-                loss = find_executable_batch_size(
-                    self._compute_candidates_loss, batch_size
-                )(sampled_ids)
+                # Choose evaluation method based on config
+                if config.use_autoregressive_loss:
+                    loss = find_executable_batch_size(
+                        self._compute_candidates_loss_autoregressive, batch_size
+                    )(sampled_ids)
+                else:
+                    loss = find_executable_batch_size(
+                        self._compute_candidates_loss, batch_size
+                    )(sampled_ids)
                 current_loss = loss.min().item()
                 optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
 
@@ -359,7 +384,9 @@ class GCG:
             buffer.log_buffer(tokenizer)
 
             if self.stop_flag:
-                logger.info("Early stopping due to finding a perfect match.")
+                logger.info(
+                    f"Early stopping triggered  (Config: {self.config.early_stop})"
+                )
                 break
 
         min_loss_index = losses.index(min(losses))
@@ -426,9 +453,15 @@ class GCG:
         true_buffer_size = max(1, config.buffer_size)
 
         # Compute the loss on the initial buffer entries across all prompts
-        init_buffer_losses = find_executable_batch_size(
-            self._compute_candidates_loss, true_buffer_size
-        )(init_buffer_ids)
+        # Use the same evaluation method as configured for the main optimization loop
+        if config.use_autoregressive_loss:
+            init_buffer_losses = find_executable_batch_size(
+                self._compute_candidates_loss_autoregressive, true_buffer_size
+            )(init_buffer_ids)
+        else:
+            init_buffer_losses = find_executable_batch_size(
+                self._compute_candidates_loss, true_buffer_size
+            )(init_buffer_ids)
 
         # Populate the buffer
         for i in range(true_buffer_size):
@@ -523,6 +556,103 @@ class GCG:
 
         return optim_ids_onehot_grad
 
+    def _check_early_stopping(
+        self,
+        prompt_data: dict,
+        current_batch_size: int,
+        shift_logits: torch.Tensor = None,
+        shift_labels: torch.Tensor = None,
+        loss: torch.Tensor = None,
+        generated_tokens: torch.Tensor = None,
+    ) -> bool:
+        """Check early stopping conditions and log debug messages.
+
+        Args:
+            prompt_data: Dictionary containing prompt information
+            current_batch_size: Size of current batch
+            shift_logits: Logits for teacher forcing evaluation (optional)
+            shift_labels: Target labels for teacher forcing evaluation (optional)
+            loss: Computed loss values (optional, for loss-based stopping)
+            generated_tokens: Generated token sequences (optional, for autoregressive evaluation)
+
+        Returns:
+            bool: True if early stopping should be triggered
+        """
+        if not self.config.early_stop.enabled:
+            return False
+
+        should_stop = False
+
+        if self.config.early_stop.metric == ESMetric.MATCH:
+            if shift_logits is not None and shift_labels is not None:
+                # Teacher forcing mode: check argmax matches
+                matches = torch.all(
+                    torch.argmax(shift_logits, dim=-1) == shift_labels,
+                    dim=-1,
+                )
+
+                if self.config.debug and torch.any(matches):
+                    matching_indices = torch.where(matches)[0]
+                    for idx in matching_indices:
+                        generated_str = self.tokenizer.decode(
+                            torch.argmax(shift_logits[idx], dim=-1)
+                        )
+                        logger.debug(
+                            f"Target string generated! Batch index {idx}: "
+                            f"'{generated_str}' matches target '{prompt_data['target']}'"
+                        )
+
+            elif generated_tokens is not None:
+                # Autoregressive mode: check exact sequence matches
+                target_ids = prompt_data["target_ids"]
+                expanded_target = target_ids.expand(current_batch_size, -1)
+                matches = torch.all(generated_tokens == expanded_target, dim=-1)
+
+                if self.config.debug and torch.any(matches):
+                    matching_indices = torch.where(matches)[0]
+                    for idx in matching_indices:
+                        generated_str = self.tokenizer.decode(generated_tokens[idx])
+                        logger.debug(
+                            f"Exact match in autoregressive generation! Batch index {idx}: "
+                            f"'{generated_str}' matches target '{prompt_data['target']}'"
+                        )
+            else:
+                return False  # No valid inputs for match checking
+
+            # Check stopping condition
+            if self.config.early_stop.condition == ESCondition.ANY:
+                should_stop = torch.any(matches).item()
+            elif self.config.early_stop.condition == ESCondition.ALL:
+                should_stop = torch.all(matches).item()
+            elif self.config.early_stop.condition == ESCondition.FRACTION:
+                fraction_matched = matches.float().mean().item()
+                should_stop = fraction_matched >= self.config.early_stop.fraction
+
+        elif self.config.early_stop.metric == ESMetric.LOSS:
+            if loss is None:
+                return False  # No loss provided for loss-based stopping
+
+            # Check if loss is below threshold
+            low_loss_mask = loss < self.config.loss_threshold
+
+            if self.config.debug and torch.any(low_loss_mask):
+                low_loss_indices = torch.where(low_loss_mask)[0]
+                for idx in low_loss_indices:
+                    logger.debug(
+                        f"Very low loss achieved! Batch index {idx}: "
+                        f"loss = {loss[idx].item():.4f} for target '{prompt_data['target']}'"
+                    )
+
+            # Check stopping condition
+            if self.config.early_stop.condition == ESCondition.ANY:
+                should_stop = torch.any(low_loss_mask).item()
+            elif self.config.early_stop.condition == ESCondition.ALL:
+                should_stop = torch.all(low_loss_mask).item()
+            elif self.config.early_stop.condition == ESCondition.FRACTION:
+                fraction_low_loss = low_loss_mask.float().mean().item()
+                should_stop = fraction_low_loss >= self.config.early_stop.fraction
+
+        return should_stop
 
     def _compute_candidates_loss(
         self,
@@ -543,7 +673,7 @@ class GCG:
         # Debug: Check if we have valid inputs
         if sampled_ids.shape[0] == 0:
             logger.warning(
-                f"Empty sampled_ids tensor passed to _compute_candidates_loss"
+                "Empty sampled_ids tensor passed to _compute_candidates_loss"
             )
             return torch.tensor([], device=sampled_ids.device, dtype=torch.float32)
 
@@ -644,14 +774,15 @@ class GCG:
                     loss = loss.view(current_batch_size, -1).mean(dim=-1)
                     total_loss += loss
 
-                    if self.config.early_stop:
-                        if torch.any(
-                            torch.all(
-                                torch.argmax(shift_logits, dim=-1) == shift_labels,
-                                dim=-1,
-                            )
-                        ).item():
-                            self.stop_flag = True
+                    # Early stopping check
+                    if self._check_early_stopping(
+                        prompt_data,
+                        current_batch_size,
+                        shift_logits=shift_logits,
+                        shift_labels=shift_labels,
+                        loss=loss,
+                    ):
+                        self.stop_flag = True
 
                     del outputs
                     gc.collect()
@@ -666,12 +797,184 @@ class GCG:
 
         # Clean up cached objects to prevent memory accumulation
         prompt_cache_batches.clear()
-        
+
         if not all_loss:
             # Handle edge case where no losses were computed
             return torch.tensor([], device=sampled_ids.device, dtype=torch.float32)
         return torch.cat(all_loss, dim=0)
 
+    def _compute_candidates_loss_autoregressive(
+        self,
+        search_batch_size: int,
+        sampled_ids: Tensor,
+    ) -> Tensor:
+        """Computes the GCG loss on candidate token sequences using autoregressive generation.
+
+        This method evaluates candidates by generating tokens autoregressively (without teacher forcing),
+        making it more realistic to actual inference-time behavior. It computes the negative log-likelihood
+        of the target sequence under the autoregressive generation process.
+
+        Args:
+            search_batch_size : int
+                the number of candidate sequences to evaluate in a given batch
+            sampled_ids : Tensor, shape = (search_width, n_optim_ids)
+                the candidate token id sequences to evaluate
+        """
+        all_loss = []
+        embedding_layer = self.embedding_layer
+
+        # Debug: Check if we have valid inputs
+        if sampled_ids.shape[0] == 0:
+            logger.warning(
+                "Empty sampled_ids tensor passed to _compute_candidates_loss_autoregressive"
+            )
+            return torch.tensor([], device=sampled_ids.device, dtype=torch.float32)
+
+        # Cache optimization: store expanded caches per prompt to reuse across batches
+        prompt_cache_batches = {}  # Dict[int, DynamicCache] - keyed by prompt index
+        cache_batch_size = None  # Track the batch size for which caches were built
+
+        for i in range(0, sampled_ids.shape[0], search_batch_size):
+            with torch.no_grad():
+                sampled_ids_batch = sampled_ids[i : i + search_batch_size]
+                current_batch_size = sampled_ids_batch.shape[0]
+
+                # Compute average loss across all prompts for this batch
+                total_loss = 0.0
+                for prompt_idx, prompt_data in enumerate(self.prompt_data):
+                    # Initialize loss accumulator for this prompt
+                    sequence_loss = torch.zeros(
+                        current_batch_size, device=sampled_ids.device
+                    )
+
+                    # Get target information
+                    target_ids = prompt_data["target_ids"]
+                    target_length = target_ids.shape[1]
+
+                    # Track generated tokens for exact match checking
+                    generated_tokens = torch.zeros(
+                        (current_batch_size, target_length),
+                        dtype=torch.long,
+                        device=sampled_ids.device,
+                    )
+
+                    # Prepare initial embeddings and cache
+                    if prompt_data.get("prefix_cache"):
+                        # Start with optim + after embeddings (prefix is already cached)
+                        current_embeds = torch.cat(
+                            [
+                                embedding_layer(sampled_ids_batch),
+                                prompt_data["after_embeds"].repeat(
+                                    current_batch_size, 1, 1
+                                ),
+                            ],
+                            dim=1,
+                        )
+
+                        # Only rebuild cache when necessary
+                        if (
+                            cache_batch_size != current_batch_size
+                            or prompt_idx not in prompt_cache_batches
+                        ):
+                            prefix_cache_batch = DynamicCache()
+                            for layer_idx in range(len(prompt_data["prefix_cache"])):
+                                key, value = prompt_data["prefix_cache"][layer_idx]
+                                prefix_cache_batch.update(
+                                    key.expand(current_batch_size, -1, -1, -1),
+                                    value.expand(current_batch_size, -1, -1, -1),
+                                    layer_idx,
+                                )
+                            prompt_cache_batches[prompt_idx] = prefix_cache_batch
+                        else:
+                            # Reuse existing expanded cache
+                            prefix_cache_batch = prompt_cache_batches[prompt_idx]
+
+                        current_cache = prefix_cache_batch
+                    else:
+                        # Without prefix cache, start with full prompt embeddings
+                        current_embeds = torch.cat(
+                            [
+                                prompt_data["before_embeds"].repeat(
+                                    current_batch_size, 1, 1
+                                ),
+                                embedding_layer(sampled_ids_batch),
+                                prompt_data["after_embeds"].repeat(
+                                    current_batch_size, 1, 1
+                                ),
+                            ],
+                            dim=1,
+                        )
+                        current_cache = None
+
+                    # Generate tokens autoregressively and compute loss at each step
+                    for t in range(target_length):
+                        # Forward pass with current embeddings
+                        outputs = self.model(
+                            inputs_embeds=current_embeds,
+                            past_key_values=current_cache,
+                            use_cache=True,
+                        )
+
+                        # Get logits for the last position (next token prediction)
+                        logits = outputs.logits[:, -1, :]
+
+                        # Compute log probabilities
+                        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+                        # Get the log probability of the target token at this position
+                        target_token = target_ids[:, t].expand(current_batch_size)
+                        token_log_probs = log_probs.gather(
+                            1, target_token.unsqueeze(1)
+                        ).squeeze(1)
+
+                        # Accumulate negative log likelihood
+                        sequence_loss -= token_log_probs
+
+                        # For next step: use the predicted token (greedy decoding)
+                        # This is the key difference from teacher forcing
+                        next_token = logits.argmax(dim=-1)
+                        next_embeds = embedding_layer(next_token).unsqueeze(1)
+
+                        # Store generated token for exact match checking
+                        generated_tokens[:, t] = next_token
+
+                        # Update inputs for next step
+                        current_embeds = next_embeds
+                        current_cache = outputs.past_key_values
+
+                    # Average loss over sequence length to get per-token loss
+                    loss = sequence_loss / target_length
+
+                    # Add this prompt's loss to the total
+                    total_loss += loss
+
+                    # Early stopping check
+                    if self._check_early_stopping(
+                        prompt_data,
+                        current_batch_size,
+                        loss=loss,
+                        generated_tokens=generated_tokens,
+                    ):
+                        self.stop_flag = True
+
+                    del outputs
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
+                # Average loss across all prompts
+                avg_loss = total_loss / len(self.prompt_data)
+                all_loss.append(avg_loss)
+
+                # Update batch size tracker for cache optimization
+                cache_batch_size = current_batch_size
+
+        # Clean up cached objects to prevent memory accumulation
+        prompt_cache_batches.clear()
+
+        if not all_loss:
+            # Handle edge case where no losses were computed
+            return torch.tensor([], device=sampled_ids.device, dtype=torch.float32)
+        return torch.cat(all_loss, dim=0)
 
 
 # A wrapper around the GCG `run` method that provides a simple API
@@ -696,6 +999,10 @@ def run_nanogcg(
         config = GCGConfig()
 
     logger.setLevel(getattr(logging, config.verbosity))
+
+    # Enable debug logging if debug flag is set
+    if config.debug:
+        logger.setLevel(logging.DEBUG)
 
     gcg = GCG(model, tokenizer, config)
     result = gcg.run(messages_and_targets)

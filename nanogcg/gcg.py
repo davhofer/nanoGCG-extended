@@ -2,7 +2,7 @@ import copy
 import gc
 import logging
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from tqdm import tqdm
 from typing import List, Optional, Tuple, Union
@@ -64,7 +64,7 @@ class GCGConfig:
     buffer_size: int = 0
     use_mellowmax: bool = False
     mellowmax_alpha: float = 1.0
-    early_stop: EarlyStoppingConfig = EarlyStoppingConfig()
+    early_stop: EarlyStoppingConfig = field(default_factory=EarlyStoppingConfig)
     use_prefix_cache: bool = True
     allow_non_ascii: bool = False
     filter_ids: bool = True

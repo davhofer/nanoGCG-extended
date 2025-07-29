@@ -1,6 +1,7 @@
 import copy
 import gc
 import logging
+import os
 
 from dataclasses import dataclass, field
 from enum import Enum
@@ -10,6 +11,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import transformers
 from torch import Tensor
+from torch.profiler import profile, ProfilerActivity
 from transformers import set_seed, DynamicCache
 
 from nanogcg.utils import (
@@ -69,10 +71,13 @@ class GCGConfig:
     allow_non_ascii: bool = False
     filter_ids: bool = True
     add_space_before_target: bool = False
-    use_autoregressive_loss: bool = False
+    use_autoregressive_loss: bool = True
     seed: int = None
     verbosity: str = "INFO"
     debug: bool = False
+    # Profiling options
+    enable_profiling: bool = False
+    profiling_output_dir: str = "./profiling_results"
 
 
 @dataclass
@@ -244,6 +249,42 @@ class GCG:
                 "{% for message in messages %}{{ message['content'] }}{% endfor %}"
             )
 
+        # Initialize profiling
+        self.profiler = None
+        if config.enable_profiling:
+            self._init_profiling()
+
+    def _init_profiling(self):
+        """Initialize the torch profiler for Chrome/Perfetto trace output."""
+        # Create output directory if it doesn't exist
+        os.makedirs(self.config.profiling_output_dir, exist_ok=True)
+        
+        # Determine activities based on device
+        activities = [ProfilerActivity.CPU]
+        if self.model.device.type == "cuda":
+            activities.append(ProfilerActivity.CUDA)
+        
+        self.profiler = profile(
+            activities=activities,
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=True
+        )
+        
+        logger.info(f"Profiling enabled. Chrome traces will be saved to {self.config.profiling_output_dir}")
+        logger.info("View traces at: chrome://tracing/ or https://ui.perfetto.dev/")
+
+    def _save_profiling_results(self):
+        """Save profiling trace for Chrome/Perfetto visualization."""
+        if not self.profiler:
+            return
+            
+        trace_file = os.path.join(self.config.profiling_output_dir, "nanogcg_trace.json")
+        
+        self.profiler.export_chrome_trace(trace_file)
+        logger.info(f"Profiling trace saved to: {trace_file}")
+        logger.info("View at: chrome://tracing/ or https://ui.perfetto.dev/")
+
     def run(
         self,
         messages_and_targets: List[Tuple[Union[str, List[dict]], str]],
@@ -335,7 +376,12 @@ class GCG:
         losses = []
         optim_strings = []
 
-        for _ in tqdm(range(config.num_steps)):
+        # Start profiling if enabled
+        if config.enable_profiling and self.profiler:
+            self.profiler.start()
+            logger.info("Started profiling...")
+
+        for step in tqdm(range(config.num_steps)):
             # Compute the token gradient across all prompts
             optim_ids_onehot_grad = self.compute_token_gradient(optim_ids)
 
@@ -388,6 +434,12 @@ class GCG:
                     f"Early stopping triggered  (Config: {self.config.early_stop})"
                 )
                 break
+
+        # Stop profiling and save results
+        if config.enable_profiling and self.profiler:
+            self.profiler.stop()
+            logger.info("Stopped profiling. Analyzing results...")
+            self._save_profiling_results()
 
         min_loss_index = losses.index(min(losses))
 

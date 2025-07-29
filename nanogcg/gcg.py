@@ -266,7 +266,7 @@ class GCG:
 
         return profile(
             activities=activities,
-            record_shapes=True,
+            record_shapes=False,
             profile_memory=True,
             with_stack=True,
         )

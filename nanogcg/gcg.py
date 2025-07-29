@@ -33,6 +33,14 @@ if not logger.hasHandlers():
     logger.setLevel(logging.INFO)
 
 
+def trace_handler(prof, output_dir: str):
+    if output_dir.endswith("/"):
+        output_dir = output_dir[:-1]
+    trace_file = f"{output_dir}/trace_{prof.step_num}.json"
+    prof.export_chrome_trace(trace_file)
+    logger.info(f"Profiling trace saved to: {trace_file}")
+
+
 class ESMetric(Enum):
     MATCH = 1
     LOSS = 2
@@ -271,14 +279,15 @@ class GCG:
             with_stack=True,
             schedule=schedule(
                 wait=2,  # Skip first 2 iterations
-                warmup=2,  # Warmup for 2 iterations
-                active=5,  # Profile next 5 iterations
+                warmup=1,  # Warmup for 2 iterations
+                active=3,  # Profile next 5 iterations
                 repeat=1,  # Do this cycle once
             ),
+            on_trace_ready=trace_handler,
         )
 
     def _optimization_loop(
-        self, config, buffer, optim_ids, losses, optim_strings, tokenizer
+        self, config, buffer, optim_ids, losses, optim_strings, tokenizer, prof=None
     ):
         """Run the main GCG optimization loop."""
         for step in tqdm(range(config.num_steps)):
@@ -328,6 +337,10 @@ class GCG:
             optim_strings.append(optim_str)
 
             buffer.log_buffer(tokenizer)
+
+            # profiler step
+            if prof is not None:
+                prof.step()
 
             if self.stop_flag:
                 logger.info(
@@ -428,17 +441,18 @@ class GCG:
 
         # Run optimization loop with or without profiling
         if config.enable_profiling:
-            profiler = self._setup_profiler()
-            trace_file = os.path.join(config.profiling_output_dir, "nanogcg_trace.json")
-            
-            with profiler:
+            prof = self._setup_profiler()
+
+            with prof:
                 self._optimization_loop(
-                    config, buffer, optim_ids, losses, optim_strings, tokenizer
+                    config,
+                    buffer,
+                    optim_ids,
+                    losses,
+                    optim_strings,
+                    tokenizer,
+                    prof=prof,
                 )
-                # Save profiling results before context manager exits
-                profiler.export_chrome_trace(trace_file)
-                logger.info(f"Profiling trace saved to: {trace_file}")
-                logger.info("View at: chrome://tracing/ or https://ui.perfetto.dev/")
         else:
             self._optimization_loop(
                 config, buffer, optim_ids, losses, optim_strings, tokenizer

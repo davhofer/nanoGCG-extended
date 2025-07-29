@@ -429,16 +429,16 @@ class GCG:
         # Run optimization loop with or without profiling
         if config.enable_profiling:
             profiler = self._setup_profiler()
+            trace_file = os.path.join(config.profiling_output_dir, "nanogcg_trace.json")
+            
             with profiler:
                 self._optimization_loop(
                     config, buffer, optim_ids, losses, optim_strings, tokenizer
                 )
-
-            # Save profiling results after context manager exits
-            trace_file = os.path.join(config.profiling_output_dir, "nanogcg_trace.json")
-            profiler.export_chrome_trace(trace_file)
-            logger.info(f"Profiling trace saved to: {trace_file}")
-            logger.info("View at: chrome://tracing/ or https://ui.perfetto.dev/")
+                # Save profiling results before context manager exits
+                profiler.export_chrome_trace(trace_file)
+                logger.info(f"Profiling trace saved to: {trace_file}")
+                logger.info("View at: chrome://tracing/ or https://ui.perfetto.dev/")
         else:
             self._optimization_loop(
                 config, buffer, optim_ids, losses, optim_strings, tokenizer

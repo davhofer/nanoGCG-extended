@@ -32,11 +32,11 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+TRACE_OUTPUT_DIR = "./profiling_results"
 
-def trace_handler(prof, output_dir: str):
-    if output_dir.endswith("/"):
-        output_dir = output_dir[:-1]
-    trace_file = f"{output_dir}/trace_{prof.step_num}.json"
+
+def trace_handler(prof):
+    trace_file = f"{TRACE_OUTPUT_DIR}/trace_{prof.step_num}.json"
     prof.export_chrome_trace(trace_file)
     logger.info(f"Profiling trace saved to: {trace_file}")
 
@@ -85,7 +85,6 @@ class GCGConfig:
     debug: bool = False
     # Profiling options
     enable_profiling: bool = False
-    profiling_output_dir: str = "./profiling_results"
 
 
 @dataclass
@@ -260,7 +259,7 @@ class GCG:
     def _setup_profiler(self):
         """Initialize and return the torch profiler for Chrome/Perfetto trace output."""
         # Create output directory if it doesn't exist
-        os.makedirs(self.config.profiling_output_dir, exist_ok=True)
+        os.makedirs(TRACE_OUTPUT_DIR, exist_ok=True)
 
         # Determine activities based on device
         activities = [ProfilerActivity.CPU]
@@ -268,7 +267,7 @@ class GCG:
             activities.append(ProfilerActivity.CUDA)
 
         logger.info(
-            f"Profiling enabled. Chrome traces will be saved to {self.config.profiling_output_dir}"
+            f"Profiling enabled. Chrome traces will be saved to {TRACE_OUTPUT_DIR}"
         )
         logger.info("View traces at: chrome://tracing/ or https://ui.perfetto.dev/")
 

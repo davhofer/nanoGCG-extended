@@ -11,7 +11,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import transformers
 from torch import Tensor
-from torch.profiler import profile, ProfilerActivity
+from torch.profiler import profile, ProfilerActivity, schedule
 from transformers import set_seed, DynamicCache
 
 from nanogcg.utils import (
@@ -269,6 +269,12 @@ class GCG:
             record_shapes=False,
             profile_memory=True,
             with_stack=True,
+            schedule=schedule(
+                wait=2,  # Skip first 2 iterations
+                warmup=2,  # Warmup for 2 iterations
+                active=5,  # Profile next 5 iterations
+                repeat=1,  # Do this cycle once
+            ),
         )
 
     def _optimization_loop(

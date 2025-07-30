@@ -80,6 +80,9 @@ class GCGConfig:
     filter_ids: bool = True
     add_space_before_target: bool = False
     use_autoregressive_loss: bool = True
+    use_straight_through_estimator: bool = (
+        False  # Use STE for differentiable generation
+    )
     seed: int = None
     verbosity: str = "INFO"
     debug: bool = False
@@ -551,6 +554,21 @@ class GCG:
             optim_ids : Tensor, shape = (1, n_optim_ids)
                 the sequence of token ids that are being optimized
         """
+        if self.config.use_autoregressive_loss:
+            return self.compute_token_gradient_autoregressive(optim_ids)
+        else:
+            return self.compute_token_gradient_teacher_forcing(optim_ids)
+
+    def compute_token_gradient_teacher_forcing(
+        self,
+        optim_ids: Tensor,
+    ) -> Tensor:
+        """Computes the gradient using teacher forcing (original method).
+
+        Args:
+            optim_ids : Tensor, shape = (1, n_optim_ids)
+                the sequence of token ids that are being optimized
+        """
         model = self.model
         embedding_layer = self.embedding_layer
 
@@ -614,6 +632,133 @@ class GCG:
                 )
 
             total_loss += loss
+
+        # Average the loss across all prompts
+        avg_loss = total_loss / len(self.prompt_data)
+
+        optim_ids_onehot_grad = torch.autograd.grad(
+            outputs=[avg_loss], inputs=[optim_ids_onehot]
+        )[0]
+
+        return optim_ids_onehot_grad
+
+    def compute_token_gradient_autoregressive(
+        self,
+        optim_ids: Tensor,
+    ) -> Tensor:
+        """Computes the gradient using autoregressive generation to match the autoregressive loss.
+
+        This method generates tokens autoregressively (without teacher forcing) and computes
+        gradients at each step, providing a better match to the inference-time behavior.
+
+        Args:
+            optim_ids : Tensor, shape = (1, n_optim_ids)
+                the sequence of token ids that are being optimized
+        """
+        model = self.model
+        embedding_layer = self.embedding_layer
+
+        # Create the one-hot encoding matrix of our optimized token ids
+        optim_ids_onehot = torch.nn.functional.one_hot(
+            optim_ids, num_classes=embedding_layer.num_embeddings
+        )
+        optim_ids_onehot = optim_ids_onehot.to(model.device, model.dtype)
+        optim_ids_onehot.requires_grad_()
+
+        # (1, num_optim_tokens, vocab_size) @ (vocab_size, embed_dim) -> (1, num_optim_tokens, embed_dim)
+        optim_embeds = optim_ids_onehot @ embedding_layer.weight
+
+        total_loss = 0.0
+        for prompt_data in self.prompt_data:
+            # Get target information
+            target_ids = prompt_data["target_ids"]
+            target_length = target_ids.shape[1]
+
+            # Initialize loss accumulator for this prompt
+            sequence_loss = 0.0
+
+            # Prepare initial embeddings and cache for autoregressive generation
+            if prompt_data.get("prefix_cache"):
+                # Start with optim + after embeddings (prefix is already cached)
+                current_embeds = torch.cat(
+                    [
+                        optim_embeds,
+                        prompt_data["after_embeds"],
+                    ],
+                    dim=1,
+                )
+                current_cache = prompt_data["prefix_cache"]
+            else:
+                # Without prefix cache, start with full prompt embeddings
+                current_embeds = torch.cat(
+                    [
+                        prompt_data["before_embeds"],
+                        optim_embeds,
+                        prompt_data["after_embeds"],
+                    ],
+                    dim=1,
+                )
+                current_cache = None
+
+            # Generate tokens autoregressively and compute loss at each step
+            for t in range(target_length):
+                # Forward pass with current embeddings
+                output = model(
+                    inputs_embeds=current_embeds,
+                    past_key_values=current_cache,
+                    use_cache=True,
+                )
+
+                # Get logits for the last position (next token prediction)
+                logits = output.logits[:, -1, :]
+
+                # Compute log probabilities
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+                # Get the log probability of the target token at this position
+                target_token = target_ids[:, t]
+                token_log_prob = log_probs.gather(1, target_token.unsqueeze(1)).squeeze(
+                    1
+                )
+
+                # Accumulate negative log likelihood (loss)
+                step_loss = -token_log_prob
+                sequence_loss += step_loss
+
+                # For next step: use the predicted token (greedy decoding)
+                # This is the key difference from teacher forcing
+                if self.config.use_straight_through_estimator:
+                    # Straight-Through Estimator: use hard argmax in forward pass,
+                    # but allow gradients to flow through soft probabilities in backward pass
+                    next_token_hard = logits.argmax(dim=-1)
+                    next_token_soft = torch.nn.functional.softmax(logits, dim=-1)
+
+                    # Create one-hot encoding of hard decision
+                    next_token_onehot = torch.nn.functional.one_hot(
+                        next_token_hard, num_classes=embedding_layer.num_embeddings
+                    ).to(logits.dtype)
+
+                    # STE trick: forward uses hard, backward uses soft
+                    next_token_ste = (
+                        next_token_onehot - next_token_soft.detach() + next_token_soft
+                    )
+
+                    # Compute embeddings using the STE tokens
+                    next_embeds = next_token_ste @ embedding_layer.weight
+                    next_embeds = next_embeds.unsqueeze(1)
+                else:
+                    # Original implementation: detached argmax
+                    with torch.no_grad():
+                        next_token = logits.argmax(dim=-1)
+                        next_embeds = embedding_layer(next_token).unsqueeze(1)
+
+                # Update inputs for next step
+                current_embeds = next_embeds
+                current_cache = output.past_key_values
+
+            # Average loss over sequence length to get per-token loss
+            prompt_loss = sequence_loss / target_length
+            total_loss += prompt_loss
 
         # Average the loss across all prompts
         avg_loss = total_loss / len(self.prompt_data)

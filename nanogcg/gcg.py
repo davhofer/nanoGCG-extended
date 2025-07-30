@@ -98,6 +98,7 @@ class GCGConfig:
     filter_ids: bool = True
     add_space_before_target: bool = False
     use_autoregressive_loss: bool = True
+    use_autoregressive_gradients: bool = False
     use_straight_through_estimator: bool = (
         False  # Use STE for differentiable generation
     )
@@ -574,7 +575,7 @@ class GCG:
             optim_ids : Tensor, shape = (1, n_optim_ids)
                 the sequence of token ids that are being optimized
         """
-        if self.config.use_autoregressive_loss:
+        if self.config.use_autoregressive_gradients:
             return self.compute_token_gradient_autoregressive(optim_ids)
         else:
             return self.compute_token_gradient_teacher_forcing(optim_ids)

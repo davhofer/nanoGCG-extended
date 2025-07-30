@@ -32,13 +32,17 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-TRACE_OUTPUT_DIR = "./profiling_results"
 
+def get_trace_handler(output_dir, filename_prefix):
+    def trace_handler(prof):
+        try:
+            trace_file = f"{output_dir}/{filename_prefix}_{prof.step_num}.json"
+            prof.export_chrome_trace(trace_file)
+            logger.info(f"Profiling trace saved to: {trace_file}")
+        except Exception as e:
+            logger.error(f"Failed to save profiling trace: {e}")
 
-def trace_handler(prof):
-    trace_file = f"{TRACE_OUTPUT_DIR}/trace_{prof.step_num}.json"
-    prof.export_chrome_trace(trace_file)
-    logger.info(f"Profiling trace saved to: {trace_file}")
+    return trace_handler
 
 
 class ESMetric(Enum):
@@ -61,6 +65,20 @@ class EarlyStoppingConfig:
     )  # Stop early if all, any, or a fraction of samples fulfill the criterion
     fraction: float = 0.5  # used with ESCondition.FRACTION. fraction of samples that needs to fulfill the criterion to stop early
     loss_threshold: float = 0.001
+
+
+@dataclass
+class ProfilingConfig:
+    enabled: bool = False
+    wait: int = 2
+    warmup: int = 1
+    active: int = 3
+    repeat: int = 1
+    record_shapes: bool = False
+    profile_memory: bool = True
+    with_stack: bool = True
+    output_dir: str = "./profiling_results"
+    filename_prefix: str = "trace"
 
 
 @dataclass
@@ -87,7 +105,7 @@ class GCGConfig:
     verbosity: str = "INFO"
     debug: bool = False
     # Profiling options
-    enable_profiling: bool = False
+    profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
 
 
 @dataclass
@@ -259,10 +277,10 @@ class GCG:
                 "{% for message in messages %}{{ message['content'] }}{% endfor %}"
             )
 
-    def _setup_profiler(self):
+    def _setup_profiler(self, config: ProfilingConfig):
         """Initialize and return the torch profiler for Chrome/Perfetto trace output."""
         # Create output directory if it doesn't exist
-        os.makedirs(TRACE_OUTPUT_DIR, exist_ok=True)
+        os.makedirs(config.output_dir, exist_ok=True)
 
         # Determine activities based on device
         activities = [ProfilerActivity.CPU]
@@ -270,22 +288,22 @@ class GCG:
             activities.append(ProfilerActivity.CUDA)
 
         logger.info(
-            f"Profiling enabled. Chrome traces will be saved to {TRACE_OUTPUT_DIR}"
+            f"Profiling enabled. Chrome traces will be saved to {config.output_dir}"
         )
         logger.info("View traces at: chrome://tracing/ or https://ui.perfetto.dev/")
 
         return profile(
             activities=activities,
-            record_shapes=False,
-            profile_memory=True,
-            with_stack=True,
+            record_shapes=config.record_shapes,
+            profile_memory=config.profile_memory,
+            with_stack=config.with_stack,
             schedule=schedule(
-                wait=2,  # Skip first 2 iterations
-                warmup=1,  # Warmup for 2 iterations
-                active=3,  # Profile next 5 iterations
-                repeat=1,  # Do this cycle once
+                wait=config.wait,
+                warmup=config.warmup,
+                active=config.active,
+                repeat=config.repeat,
             ),
-            on_trace_ready=trace_handler,
+            on_trace_ready=get_trace_handler(config.output_dir, config.filename_prefix),
         )
 
     def _optimization_loop(
@@ -442,10 +460,10 @@ class GCG:
         optim_strings = []
 
         # Run optimization loop with or without profiling
-        if config.enable_profiling:
-            prof = self._setup_profiler()
-
-            with prof:
+        if config.profiling.enabled:
+            prof = self._setup_profiler(config.profiling)
+            prof.start()
+            try:
                 self._optimization_loop(
                     config,
                     buffer,
@@ -455,6 +473,8 @@ class GCG:
                     tokenizer,
                     prof=prof,
                 )
+            finally:
+                prof.stop()
         else:
             self._optimization_loop(
                 config, buffer, optim_ids, losses, optim_strings, tokenizer

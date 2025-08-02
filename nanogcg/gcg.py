@@ -107,6 +107,8 @@ class GCGConfig:
     debug: bool = False
     # Profiling options
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    # Turn "find_executable_batch_size" on or off
+    dynamic_batch_size: bool = False
 
 
 @dataclass
@@ -239,6 +241,26 @@ def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
     return torch.stack(filtered_ids)
 
 
+"""
+loss = use_fixed_bach_size(
+    self._compute_candidates_loss_autoregressive, batch_size
+)(sampled_ids)
+
+=>
+
+use_fixed_bach_size(self._compute_candidates_loss_autoregressive, batch_size)(sampled_ids) == self._compute_candidates_loss_autoregressive(batch_size, sampled_ids)
+
+
+"""
+
+
+def use_fixed_batch_size(func, batch_size):
+    def f(ids):
+        return func(batch_size, ids)
+
+    return f
+
+
 class GCG:
     def __init__(
         self,
@@ -277,6 +299,12 @@ class GCG:
             tokenizer.chat_template = (
                 "{% for message in messages %}{{ message['content'] }}{% endfor %}"
             )
+
+        self._batch_size_handler = (
+            find_executable_batch_size
+            if self.config.dynamic_batch_size
+            else use_fixed_batch_size
+        )
 
     def _setup_profiler(self, config: ProfilingConfig):
         """Initialize and return the torch profiler for Chrome/Perfetto trace output."""
@@ -338,11 +366,11 @@ class GCG:
 
                 # Choose evaluation method based on config
                 if config.use_autoregressive_loss:
-                    loss = find_executable_batch_size(
+                    loss = self._batch_size_handler(
                         self._compute_candidates_loss_autoregressive, batch_size
                     )(sampled_ids)
                 else:
-                    loss = find_executable_batch_size(
+                    loss = self._batch_size_handler(
                         self._compute_candidates_loss, batch_size
                     )(sampled_ids)
                 current_loss = loss.min().item()
@@ -547,11 +575,11 @@ class GCG:
         # Compute the loss on the initial buffer entries across all prompts
         # Use the same evaluation method as configured for the main optimization loop
         if config.use_autoregressive_loss:
-            init_buffer_losses = find_executable_batch_size(
+            init_buffer_losses = self._batch_size_handler(
                 self._compute_candidates_loss_autoregressive, true_buffer_size
             )(init_buffer_ids)
         else:
-            init_buffer_losses = find_executable_batch_size(
+            init_buffer_losses = self._batch_size_handler(
                 self._compute_candidates_loss, true_buffer_size
             )(init_buffer_ids)
 

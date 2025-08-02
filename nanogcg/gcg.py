@@ -241,19 +241,6 @@ def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
     return torch.stack(filtered_ids)
 
 
-"""
-loss = use_fixed_bach_size(
-    self._compute_candidates_loss_autoregressive, batch_size
-)(sampled_ids)
-
-=>
-
-use_fixed_bach_size(self._compute_candidates_loss_autoregressive, batch_size)(sampled_ids) == self._compute_candidates_loss_autoregressive(batch_size, sampled_ids)
-
-
-"""
-
-
 def use_fixed_batch_size(func, batch_size):
     def f(ids):
         return func(batch_size, ids)
@@ -689,6 +676,9 @@ class GCG:
             outputs=[avg_loss], inputs=[optim_ids_onehot]
         )[0]
 
+        optim_ids_onehot.grad = None
+        del optim_ids_onehot
+
         return optim_ids_onehot_grad
 
     def compute_token_gradient_autoregressive(
@@ -815,6 +805,9 @@ class GCG:
         optim_ids_onehot_grad = torch.autograd.grad(
             outputs=[avg_loss], inputs=[optim_ids_onehot]
         )[0]
+
+        optim_ids_onehot.grad = None
+        del optim_ids_onehot
 
         return optim_ids_onehot_grad
 

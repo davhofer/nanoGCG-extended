@@ -84,7 +84,7 @@ class ProfilingConfig:
 @dataclass
 class GCGConfig:
     num_steps: int = 250
-    optim_str_init: Union[str, List[str]] = "x x x x x x x x x x x x x x x x x x x x"
+    optim_str_init: Union[str, List[str]] = " x x x x x x x x x x x x x x x x x x x x"
     search_width: int = 512
     batch_size: int = None
     topk: int = 256
@@ -96,6 +96,7 @@ class GCGConfig:
     use_prefix_cache: bool = True
     allow_non_ascii: bool = False
     filter_ids: bool = True
+    filter_ids_threshold: float = 0.5  # Fraction of samples that must fail retokenization to filter out a sequence
     add_space_before_target: bool = False
     use_autoregressive_loss: bool = True
     use_autoregressive_gradients: bool = False
@@ -107,6 +108,10 @@ class GCGConfig:
     debug: bool = False
     # Profiling options
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
+    # Turn "find_executable_batch_size" on or off
+    dynamic_batch_size: bool = False
+    # Evaluate candidates with inference loss
+    candidates_inference_loss: bool = False
 
 
 @dataclass
@@ -121,19 +126,19 @@ class GCGResult:
 class AttackBuffer:
     def __init__(self, size: int):
         self.buffer: list[
-            tuple[float, Tensor]
-        ] = []  # elements are (loss: float, optim_ids: Tensor)
+            tuple[float, Tensor, Optional[float], Optional[str]]
+        ] = []  # elements are (loss: float, optim_ids: Tensor, inference_loss: Optional[float], generated_string: Optional[str])
         self.size = size
 
-    def add(self, loss: float, optim_ids: Tensor) -> None:
+    def add(self, loss: float, optim_ids: Tensor, inference_loss: Optional[float] = None, generated_string: Optional[str] = None) -> None:
         if self.size == 0:
-            self.buffer = [(loss, optim_ids)]
+            self.buffer = [(loss, optim_ids, inference_loss, generated_string)]
             return
 
         if len(self.buffer) < self.size:
-            self.buffer.append((loss, optim_ids))
+            self.buffer.append((loss, optim_ids, inference_loss, generated_string))
         else:
-            self.buffer[-1] = (loss, optim_ids)
+            self.buffer[-1] = (loss, optim_ids, inference_loss, generated_string)
 
         self.buffer.sort(key=lambda x: x[0])
 
@@ -148,11 +153,27 @@ class AttackBuffer:
 
     def log_buffer(self, tokenizer):
         message = "buffer:"
-        for loss, ids in self.buffer:
+        for item in self.buffer:
+            if len(item) == 4:
+                loss, ids, inference_loss, generated_string = item
+            else:
+                # Backward compatibility for old buffer format
+                loss, ids = item[:2]
+                inference_loss, generated_string = None, None
+            
             optim_str = tokenizer.batch_decode(ids)[0]
             optim_str = optim_str.replace("\\", "\\\\")
             optim_str = optim_str.replace("\n", "\\n")
-            message += f"\nloss: {loss}" + f" | string: {optim_str}"
+            message += f"\nloss: {loss:.4f} | string: {optim_str}"
+            
+            if inference_loss is not None:
+                message += f" | inference_loss: {inference_loss:.4f}"
+            if generated_string is not None:
+                # Truncate generated string if too long
+                gen_str = generated_string[:50] + "..." if len(generated_string) > 50 else generated_string
+                gen_str = gen_str.replace("\\", "\\\\")
+                gen_str = gen_str.replace("\n", "\\n")
+                message += f" | generated: {gen_str}"
         logger.info(message)
 
 
@@ -206,38 +227,141 @@ def sample_ids_from_grad(
     return new_ids
 
 
-def filter_ids(ids: Tensor, tokenizer: transformers.PreTrainedTokenizer):
-    """Filters out sequeneces of token ids that change after retokenization.
+def find_token_boundaries(
+    full_ids: Tensor,
+    tokenizer: transformers.PreTrainedTokenizer,
+    before_str: str,
+    optim_str: str,
+) -> Tuple[int, int]:
+    """Find the start and end token indices for optim_str within the full tokenized sequence.
+
+    Args:
+        full_ids: Tensor of shape (seq_len,) containing the full tokenized sequence
+        tokenizer: The tokenizer
+        before_str: The string before optim_str
+        optim_str: The optimization string
+
+    Returns:
+        Tuple of (start_idx, end_idx) where optim_str tokens are full_ids[start_idx:end_idx]
+    """
+    # Decode token by token to find where before_str ends
+    reconstructed = ""
+    optim_start_idx = 0
+
+    for i in range(len(full_ids)):
+        # Decode up to and including token i
+        reconstructed = tokenizer.decode(full_ids[: i + 1])
+
+        if len(reconstructed) >= len(before_str):
+            # Check if this token crosses the boundary
+            if len(reconstructed) > len(before_str):
+                # Token crosses boundary, it's part of optim_str
+                optim_start_idx = i
+            else:
+                # Token ends exactly at boundary, optim_str starts at next token
+                optim_start_idx = i + 1
+            break
+
+    # Now find where optim_str ends
+    target_length = len(before_str) + len(optim_str)
+    optim_end_idx = optim_start_idx + 1
+
+    for i in range(optim_start_idx, len(full_ids)):
+        reconstructed = tokenizer.decode(full_ids[: i + 1])
+
+        if len(reconstructed) >= target_length:
+            optim_end_idx = i + 2  # add 1 s.t. the last token is included
+            break
+
+    return optim_start_idx, optim_end_idx
+
+
+def filter_ids(
+    ids: Tensor,
+    tokenizer: transformers.PreTrainedTokenizer,
+    prompt_data_list: List[dict],
+    threshold: float = 0.5,
+):
+    """Filters out sequences of token ids that change after retokenization across multiple samples.
 
     Args:
         ids : Tensor, shape = (search_width, n_optim_ids)
-            token ids
+            token ids being optimized
         tokenizer : ~transformers.PreTrainedTokenizer
             the model's tokenizer
+        prompt_data_list : List[dict]
+            list of prompt data dictionaries containing before_ids and after_ids for each sample
+        threshold : float
+            fraction of samples that must fail retokenization to filter out a sequence
 
     Returns:
         filtered_ids : Tensor, shape = (new_search_width, n_optim_ids)
-            all token ids that are the same after retokenization
+            all token ids that pass the threshold check
     """
-    ids_decoded = tokenizer.batch_decode(ids)
     filtered_ids = []
+    num_original = ids.shape[0]
+    num_samples = len(prompt_data_list)
 
-    for i in range(len(ids_decoded)):
-        # Retokenize the decoded token ids
-        ids_encoded = tokenizer(
-            ids_decoded[i], return_tensors="pt", add_special_tokens=False
-        ).to(ids.device)["input_ids"][0]
-        if torch.equal(ids[i], ids_encoded):
+    for i in range(ids.shape[0]):
+        # Count how many samples fail retokenization for this candidate
+        fail_count = 0
+
+        for prompt_data in prompt_data_list:
+            before_ids = prompt_data["before_ids"]
+            after_ids = prompt_data["after_ids"]
+
+            # Construct the full sequence: before + optim + after
+            full_sequence = torch.cat([before_ids[0], ids[i], after_ids[0]], dim=0)
+
+            # Decode the full sequence
+            full_decoded = tokenizer.decode(full_sequence)
+
+            # Re-encode the full sequence
+            full_encoded = tokenizer(
+                full_decoded, return_tensors="pt", add_special_tokens=False
+            ).to(ids.device)["input_ids"][0]
+
+            # Check if the full sequence matches after retokenization
+            if not torch.equal(full_sequence, full_encoded):
+                fail_count += 1
+
+        # Only filter out if failure rate exceeds threshold
+        failure_rate = fail_count / num_samples
+        if failure_rate <= threshold:
             filtered_ids.append(ids[i])
+
+    # Calculate and log the filtering statistics
+    num_filtered = num_original - len(filtered_ids)
+    fraction_filtered = num_filtered / num_original if num_original > 0 else 0.0
+    logger.info(
+        f"Filtered {num_filtered}/{num_original} sequences ({fraction_filtered:.1%}) due to tokenization mismatch "
+        f"(threshold: {threshold:.1%} of {num_samples} samples)"
+    )
 
     if not filtered_ids:
         # This occurs in some cases, e.g. using the Llama-3 tokenizer with a bad initialization
         raise RuntimeError(
-            "No token sequences are the same after decoding and re-encoding. "
-            "Consider setting `filter_ids=False` or trying a different `optim_str_init`"
+            "No token sequences pass the retokenization threshold. "
+            "Consider setting `filter_ids=False`, increasing `filter_ids_threshold`, or trying a different `optim_str_init`"
+        )
+
+    # Verify all filtered sequences have the same length before stacking
+    lengths = [len(seq) for seq in filtered_ids]
+    if len(set(lengths)) > 1:
+        raise RuntimeError(
+            f"Filtered sequences have different lengths: {set(lengths)}. "
+            "This should not happen if tokenization is consistent. "
+            "Please report this as a bug."
         )
 
     return torch.stack(filtered_ids)
+
+
+def use_fixed_batch_size(func, batch_size):
+    def f(ids):
+        return func(batch_size, ids)
+
+    return f
 
 
 class GCG:
@@ -278,6 +402,12 @@ class GCG:
             tokenizer.chat_template = (
                 "{% for message in messages %}{{ message['content'] }}{% endfor %}"
             )
+
+        self._batch_size_handler = (
+            find_executable_batch_size
+            if self.config.dynamic_batch_size
+            else use_fixed_batch_size
+        )
 
     def _setup_profiler(self, config: ProfilingConfig):
         """Initialize and return the torch profiler for Chrome/Perfetto trace output."""
@@ -330,7 +460,12 @@ class GCG:
                 )
 
                 if config.filter_ids:
-                    sampled_ids = filter_ids(sampled_ids, tokenizer)
+                    sampled_ids = filter_ids(
+                        sampled_ids,
+                        tokenizer,
+                        self.prompt_data,
+                        config.filter_ids_threshold,
+                    )
 
                 new_search_width = sampled_ids.shape[0]
 
@@ -341,20 +476,31 @@ class GCG:
 
                 # Choose evaluation method based on config
                 if config.use_autoregressive_loss:
-                    loss = find_executable_batch_size(
+                    loss = self._batch_size_handler(
                         self._compute_candidates_loss_autoregressive, batch_size
                     )(sampled_ids)
                 else:
-                    loss = find_executable_batch_size(
+                    loss = self._batch_size_handler(
                         self._compute_candidates_loss, batch_size
                     )(sampled_ids)
                 current_loss = loss.min().item()
-                optim_ids = sampled_ids[loss.argmin()].unsqueeze(0)
+                best_idx = loss.argmin()
+                optim_ids = sampled_ids[best_idx].unsqueeze(0)
+
+                # Compute inference loss if enabled
+                inference_loss = None
+                generated_string = None
+                if config.candidates_inference_loss:
+                    # Compute inference loss for the best candidate
+                    best_candidate = sampled_ids[best_idx].unsqueeze(0)
+                    inference_losses, generated_strings = self.compute_inference_loss(best_candidate)
+                    inference_loss = inference_losses[0].item()
+                    generated_string = generated_strings[0] if generated_strings else None
 
                 # Update the buffer based on the loss
                 losses.append(current_loss)
                 if buffer.size == 0 or current_loss < buffer.get_highest_loss():
-                    buffer.add(current_loss, optim_ids)
+                    buffer.add(current_loss, optim_ids, inference_loss, generated_string)
 
             optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
@@ -404,7 +550,10 @@ class GCG:
                 messages[-1]["content"] = messages[-1]["content"] + "{optim_str}"
 
             template = tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
             )
             # Remove the BOS token -- this will get added when tokenizing, if necessary
             if tokenizer.bos_token and template.startswith(tokenizer.bos_token):
@@ -419,36 +568,68 @@ class GCG:
                 # Multiple {optim_str} - use first occurrence and rejoin the rest
                 before_str = parts[0]
                 after_str = "".join(parts[1:])
-                print(
-                    "Warning: Multiple {optim_str} placeholders found, using first occurrence and removing the rest."
+                raise ValueError(
+                    "\nWARNING: Multiple {optim_str} placeholders found, using first occurrence and removing the rest.\n"
                 )
 
             target = " " + target if config.add_space_before_target else target
 
-            # Tokenize everything that doesn't get optimized
-            before_ids = tokenizer([before_str], padding=False, return_tensors="pt")[
+            # Get the initial optim_str (use the first one if it's a list)
+            if isinstance(config.optim_str_init, list):
+                init_optim_str = config.optim_str_init[0]
+            else:
+                init_optim_str = config.optim_str_init
+
+            # Tokenize the full sequence together
+            full_str = before_str + init_optim_str + after_str
+
+            if self.config.debug:
+                print("\nDEBUG OUTPUT: full string")
+                print(full_str)
+                print()
+
+            full_ids = tokenizer([full_str], padding=False, return_tensors="pt")[
                 "input_ids"
-            ].to(model.device, torch.int64)
-            after_ids = tokenizer(
-                [after_str], add_special_tokens=False, return_tensors="pt"
-            )["input_ids"].to(model.device, torch.int64)
+            ].to(model.device, torch.int64)[0]  # Remove batch dimension
+
+            # Find the boundaries of optim_str in the tokenized sequence
+            optim_start_idx, optim_end_idx = find_token_boundaries(
+                full_ids, tokenizer, before_str, init_optim_str
+            )
+
+            # Extract the token sequences for each part
+            before_ids = full_ids[:optim_start_idx].unsqueeze(
+                0
+            )  # Add batch dimension back
+            optim_ids = full_ids[optim_start_idx:optim_end_idx]
+            after_ids = full_ids[optim_end_idx:].unsqueeze(
+                0
+            )  # Add batch dimension back
+
+            # Tokenize target separately (it's not part of the prompt)
             target_ids = tokenizer(
                 [target], add_special_tokens=False, return_tensors="pt"
             )["input_ids"].to(model.device, torch.int64)
 
             # Embed everything that doesn't get optimized
             embedding_layer = self.embedding_layer
-            before_embeds, after_embeds, target_embeds = [
-                embedding_layer(ids) for ids in (before_ids, after_ids, target_ids)
-            ]
+            before_embeds = embedding_layer(before_ids)
+            after_embeds = embedding_layer(after_ids)
+            target_embeds = embedding_layer(target_ids)
 
             prompt_data = {
                 "before_embeds": before_embeds,
                 "after_embeds": after_embeds,
                 "target_embeds": target_embeds,
+                "before_ids": before_ids,
+                "after_ids": after_ids,
                 "target_ids": target_ids,
+                "optim_ids": optim_ids,  # Store the initial optim_ids
+                "optim_start_idx": optim_start_idx,
+                "optim_end_idx": optim_end_idx,
                 "before_str": before_str,
                 "after_str": after_str,
+                "init_optim_str": init_optim_str,
                 "target": target,
             }
 
@@ -516,59 +697,136 @@ class GCG:
         # Create the attack buffer and initialize the buffer ids
         buffer = AttackBuffer(config.buffer_size)
 
-        if isinstance(config.optim_str_init, str):
-            init_optim_ids = tokenizer(
-                config.optim_str_init, add_special_tokens=False, return_tensors="pt"
-            )["input_ids"].to(model.device)
-            if config.buffer_size > 1:
-                init_buffer_ids = (
-                    tokenizer(
-                        INIT_CHARS, add_special_tokens=False, return_tensors="pt"
-                    )["input_ids"]
-                    .squeeze()
-                    .to(model.device)
-                )
-                init_indices = torch.randint(
-                    0,
-                    init_buffer_ids.shape[0],
-                    (config.buffer_size - 1, init_optim_ids.shape[1]),
-                )
-                init_buffer_ids = torch.cat(
-                    [init_optim_ids, init_buffer_ids[init_indices]], dim=0
-                )
-            else:
-                init_buffer_ids = init_optim_ids
+        if not self.prompt_data:
+            raise ValueError("No prompt data available for initialization")
 
-        else:  # assume list
+        # Get reference strings from first prompt for context
+        before_str = self.prompt_data[0]["before_str"]
+        after_str = self.prompt_data[0]["after_str"]
+
+        # Initialize list to store different optim_ids for buffer
+        all_init_optim_ids = []
+
+        if isinstance(config.optim_str_init, str):
+            # Use the optim_ids from the first prompt_data
+            init_optim_ids = self.prompt_data[0]["optim_ids"]
+            target_length = len(init_optim_ids)
+            all_init_optim_ids.append(init_optim_ids)
+
+            if config.buffer_size > 1:
+                # Generate additional random initializations with same token length
+                init_optim_str = self.prompt_data[0]["init_optim_str"]
+                approx_char_length = len(init_optim_str)
+
+                max_attempts = 100  # Prevent infinite loops
+
+                for i in range(config.buffer_size - 1):
+                    attempts = 0
+                    found_match = False
+
+                    while attempts < max_attempts and not found_match:
+                        # Start with a reasonable guess for string length
+                        if attempts == 0:
+                            num_chars = max(1, approx_char_length // 2)
+                        else:
+                            # Adjust based on previous attempts
+                            num_chars = max(
+                                1, num_chars + torch.randint(-2, 3, (1,)).item()
+                            )
+
+                        random_indices = torch.randint(0, len(INIT_CHARS), (num_chars,))
+                        random_str = "".join(
+                            [INIT_CHARS[idx] for idx in random_indices]
+                        )
+
+                        # Tokenize in context to get proper tokens
+                        full_str = before_str + random_str + after_str
+                        full_ids = tokenizer(
+                            [full_str], padding=False, return_tensors="pt"
+                        )["input_ids"].to(model.device, torch.int64)[0]
+
+                        # Find boundaries for this random string
+                        start_idx, end_idx = find_token_boundaries(
+                            full_ids, tokenizer, before_str, random_str
+                        )
+
+                        random_optim_ids = full_ids[start_idx:end_idx]
+
+                        if len(random_optim_ids) == target_length:
+                            all_init_optim_ids.append(random_optim_ids)
+                            found_match = True
+
+                        attempts += 1
+
+                    if not found_match:
+                        # If we couldn't find a match, use the original init repeated with different positions
+                        logger.warning(
+                            f"Could not generate random init {i + 1} with length {target_length}, using shuffled original"
+                        )
+                        shuffled_ids = init_optim_ids[
+                            torch.randperm(len(init_optim_ids))
+                        ]
+                        all_init_optim_ids.append(shuffled_ids)
+
+        else:
+            # Handle list of initializations
             if len(config.optim_str_init) != config.buffer_size:
                 logger.warning(
                     f"Using {len(config.optim_str_init)} initializations but buffer size is set to {config.buffer_size}"
                 )
-            try:
-                init_buffer_ids = tokenizer(
-                    config.optim_str_init, add_special_tokens=False, return_tensors="pt"
-                )["input_ids"].to(model.device)
-            except ValueError:
-                logger.error(
-                    "Unable to create buffer. Ensure that all initializations tokenize to the same length."
+
+            # First pass: tokenize all and check if they have the same length
+            tokenized_inits = []
+            for init_str in config.optim_str_init:
+                full_str = before_str + init_str + after_str
+                full_ids = tokenizer([full_str], padding=False, return_tensors="pt")[
+                    "input_ids"
+                ].to(model.device, torch.int64)[0]
+
+                start_idx, end_idx = find_token_boundaries(
+                    full_ids, tokenizer, before_str, init_str
                 )
 
-        true_buffer_size = max(1, config.buffer_size)
+                optim_ids = full_ids[start_idx:end_idx]
+                tokenized_inits.append(optim_ids)
+
+            # Check if all have the same length
+            lengths = [len(ids) for ids in tokenized_inits]
+            if len(set(lengths)) > 1:
+                raise ValueError(
+                    f"All initializations must tokenize to the same length when using a list, "
+                    f"but got lengths: {lengths}. Consider using a single string initialization."
+                )
+
+            all_init_optim_ids = tokenized_inits
+
+        true_buffer_size = len(all_init_optim_ids)
+
+        # Stack all init optim_ids into a single tensor since they all have the same length
+        init_buffer_ids = torch.stack(all_init_optim_ids, dim=0)
 
         # Compute the loss on the initial buffer entries across all prompts
         # Use the same evaluation method as configured for the main optimization loop
         if config.use_autoregressive_loss:
-            init_buffer_losses = find_executable_batch_size(
+            init_buffer_losses = self._batch_size_handler(
                 self._compute_candidates_loss_autoregressive, true_buffer_size
             )(init_buffer_ids)
         else:
-            init_buffer_losses = find_executable_batch_size(
+            init_buffer_losses = self._batch_size_handler(
                 self._compute_candidates_loss, true_buffer_size
             )(init_buffer_ids)
 
+        # Compute inference losses if enabled
+        init_inference_losses = None
+        init_generated_strings = None
+        if config.candidates_inference_loss:
+            init_inference_losses, init_generated_strings = self.compute_inference_loss(init_buffer_ids)
+
         # Populate the buffer
         for i in range(true_buffer_size):
-            buffer.add(init_buffer_losses[i], init_buffer_ids[[i]])
+            inference_loss = init_inference_losses[i].item() if init_inference_losses is not None else None
+            generated_string = init_generated_strings[i] if init_generated_strings else None
+            buffer.add(init_buffer_losses[i], init_buffer_ids[[i]], inference_loss, generated_string)
 
         buffer.log_buffer(tokenizer)
 
@@ -671,6 +929,9 @@ class GCG:
         optim_ids_onehot_grad = torch.autograd.grad(
             outputs=[avg_loss], inputs=[optim_ids_onehot]
         )[0]
+
+        optim_ids_onehot.grad = None
+        del optim_ids_onehot
 
         return optim_ids_onehot_grad
 
@@ -799,6 +1060,9 @@ class GCG:
             outputs=[avg_loss], inputs=[optim_ids_onehot]
         )[0]
 
+        optim_ids_onehot.grad = None
+        del optim_ids_onehot
+
         return optim_ids_onehot_grad
 
     def _check_early_stopping(
@@ -878,7 +1142,7 @@ class GCG:
                 return False  # No loss provided for loss-based stopping
 
             # Check if loss is below threshold
-            low_loss_mask = loss < self.config.loss_threshold
+            low_loss_mask = loss < self.config.early_stop.loss_threshold
 
             if self.config.debug and torch.any(low_loss_mask):
                 low_loss_indices = torch.where(low_loss_mask)[0]
@@ -956,11 +1220,6 @@ class GCG:
             )
             return torch.tensor([], device=sampled_ids.device, dtype=torch.float32)
 
-        # TODO: evaluate in practice whether the memory overhead is manageable
-        # Cache optimization: store expanded caches per prompt to reuse across batches
-        prompt_cache_batches = {}  # Dict[int, DynamicCache] - keyed by prompt index
-        cache_batch_size = None  # Track the batch size for which caches were built
-
         for i in range(0, sampled_ids.shape[0], search_batch_size):
             with torch.no_grad():
                 sampled_ids_batch = sampled_ids[i : i + search_batch_size]
@@ -984,24 +1243,15 @@ class GCG:
                             dim=1,
                         )
 
-                        # OPTIMIZATION: Only rebuild cache when necessary
-                        # Need to rebuild if: 1) first time seeing this prompt, or 2) batch size changed
-                        if (
-                            cache_batch_size != current_batch_size
-                            or prompt_idx not in prompt_cache_batches
-                        ):
-                            prefix_cache_batch = DynamicCache()
-                            for layer_idx in range(len(prompt_data["prefix_cache"])):
-                                key, value = prompt_data["prefix_cache"][layer_idx]
-                                prefix_cache_batch.update(
-                                    key.expand(current_batch_size, -1, -1, -1),
-                                    value.expand(current_batch_size, -1, -1, -1),
-                                    layer_idx,
-                                )
-                            prompt_cache_batches[prompt_idx] = prefix_cache_batch
-                        else:
-                            # Reuse existing expanded cache
-                            prefix_cache_batch = prompt_cache_batches[prompt_idx]
+                        # Expand prefix cache for current batch size
+                        prefix_cache_batch = DynamicCache()
+                        for layer_idx in range(len(prompt_data["prefix_cache"])):
+                            key, value = prompt_data["prefix_cache"][layer_idx]
+                            prefix_cache_batch.update(
+                                key.expand(current_batch_size, -1, -1, -1),
+                                value.expand(current_batch_size, -1, -1, -1),
+                                layer_idx,
+                            )
 
                         outputs = self.model(
                             inputs_embeds=input_embeds_batch,
@@ -1071,16 +1321,116 @@ class GCG:
                 avg_loss = total_loss / len(self.prompt_data)
                 all_loss.append(avg_loss)
 
-                # Update batch size tracker for cache optimization
-                cache_batch_size = current_batch_size
-
-        # Clean up cached objects to prevent memory accumulation
-        prompt_cache_batches.clear()
-
         if not all_loss:
             # Handle edge case where no losses were computed
             return torch.tensor([], device=sampled_ids.device, dtype=torch.float32)
         return torch.cat(all_loss, dim=0)
+
+    def compute_inference_loss(
+        self,
+        sampled_ids: Tensor,
+        max_new_tokens: int = 100,
+    ) -> Tuple[Tensor, List[str]]:
+        """Evaluates candidate strings using realistic autoregressive generation and text-based loss.
+
+        This method simulates actual inference by generating output autoregressively with the candidate
+        strings and computes Levenshtein distance between generated and target text.
+
+        Args:
+            sampled_ids : Tensor, shape = (search_width, n_optim_ids)
+                the candidate token id sequences to evaluate
+            max_new_tokens : int
+                maximum number of tokens to generate during inference
+
+        Returns:
+            Tuple of:
+                - Tensor, shape = (search_width,) containing Levenshtein distances for each candidate
+                - List[str] containing generated text for each candidate (from first prompt only for display)
+        """
+
+        def levenshtein(s1, s2):
+            """Compute Levenshtein distance between two strings."""
+            if len(s1) < len(s2):
+                return levenshtein(s2, s1)
+
+            # If one string is empty
+            if len(s2) == 0:
+                return len(s1)
+
+            previous_row = list(range(len(s2) + 1))
+            for i, c1 in enumerate(s1):
+                current_row = [i + 1]
+                for j, c2 in enumerate(s2):
+                    insertions = previous_row[j + 1] + 1  # Insertion
+                    deletions = current_row[j] + 1  # Deletion
+                    substitutions = previous_row[j] + (c1 != c2)  # Substitution
+                    current_row.append(min(insertions, deletions, substitutions))
+                previous_row = current_row
+
+            return previous_row[-1]
+
+        all_distances = []
+        generated_strings = []  # Store generated strings from first prompt for display
+
+        for prompt_idx, prompt_data in enumerate(self.prompt_data):
+            prompt_distances = []
+
+            # Process each candidate
+            for i in range(sampled_ids.shape[0]):
+                candidate_ids = sampled_ids[i]
+
+                # Construct the full input sequence for inference
+                # Combine before_ids + candidate_ids + after_ids
+                before_ids = prompt_data["before_ids"][0]  # Remove batch dimension
+                after_ids = prompt_data["after_ids"][0]  # Remove batch dimension
+
+                # Create full input sequence
+                full_input_ids = torch.cat(
+                    [before_ids, candidate_ids, after_ids], dim=0
+                ).unsqueeze(0)  # Add batch dimension
+
+                # Generate output autoregressively using model.generate()
+                with torch.inference_mode():
+                    outputs = self.model.generate(
+                        input_ids=full_input_ids,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,  # Greedy decoding for consistency
+                        use_cache=True,  # Fast generation with KV cache
+                        pad_token_id=self.tokenizer.pad_token_id,
+                        eos_token_id=self.tokenizer.eos_token_id,
+                    )
+
+                    # Extract only the newly generated tokens
+                    generated_tokens = outputs[0][len(full_input_ids[0]) :]
+
+                    # Decode to text
+                    generated_text = self.tokenizer.decode(
+                        generated_tokens, skip_special_tokens=True
+                    )
+                    target_text = prompt_data["target"]
+
+                    # Compute Levenshtein distance
+                    distance = levenshtein(generated_text, target_text)
+
+                    # Normalize by target length to get relative distance
+                    normalized_distance = distance / max(len(target_text), 1)
+                    prompt_distances.append(normalized_distance)
+                    
+                    # Store generated string from first prompt for display
+                    if prompt_idx == 0:
+                        generated_strings.append(generated_text)
+
+            all_distances.append(
+                torch.tensor(prompt_distances, device=sampled_ids.device)
+            )
+
+        # Average distances across all prompts
+        if all_distances:
+            avg_distances = torch.stack(all_distances).mean(dim=0)
+        else:
+            avg_distances = torch.zeros(sampled_ids.shape[0], device=sampled_ids.device)
+
+        return avg_distances, generated_strings
 
     def _compute_candidates_loss_autoregressive(
         self,
@@ -1108,10 +1458,6 @@ class GCG:
                 "Empty sampled_ids tensor passed to _compute_candidates_loss_autoregressive"
             )
             return torch.tensor([], device=sampled_ids.device, dtype=torch.float32)
-
-        # Cache optimization: store expanded caches per prompt to reuse across batches
-        prompt_cache_batches = {}  # Dict[int, DynamicCache] - keyed by prompt index
-        cache_batch_size = None  # Track the batch size for which caches were built
 
         for i in range(0, sampled_ids.shape[0], search_batch_size):
             with torch.no_grad():
@@ -1150,23 +1496,15 @@ class GCG:
                             dim=1,
                         )
 
-                        # Only rebuild cache when necessary
-                        if (
-                            cache_batch_size != current_batch_size
-                            or prompt_idx not in prompt_cache_batches
-                        ):
-                            prefix_cache_batch = DynamicCache()
-                            for layer_idx in range(len(prompt_data["prefix_cache"])):
-                                key, value = prompt_data["prefix_cache"][layer_idx]
-                                prefix_cache_batch.update(
-                                    key.expand(current_batch_size, -1, -1, -1),
-                                    value.expand(current_batch_size, -1, -1, -1),
-                                    layer_idx,
-                                )
-                            prompt_cache_batches[prompt_idx] = prefix_cache_batch
-                        else:
-                            # Reuse existing expanded cache
-                            prefix_cache_batch = prompt_cache_batches[prompt_idx]
+                        # Expand prefix cache for current batch size
+                        prefix_cache_batch = DynamicCache()
+                        for layer_idx in range(len(prompt_data["prefix_cache"])):
+                            key, value = prompt_data["prefix_cache"][layer_idx]
+                            prefix_cache_batch.update(
+                                key.expand(current_batch_size, -1, -1, -1),
+                                value.expand(current_batch_size, -1, -1, -1),
+                                layer_idx,
+                            )
 
                         current_cache = prefix_cache_batch
                     else:
@@ -1243,12 +1581,6 @@ class GCG:
                 # Average loss across all prompts
                 avg_loss = total_loss / len(self.prompt_data)
                 all_loss.append(avg_loss)
-
-                # Update batch size tracker for cache optimization
-                cache_batch_size = current_batch_size
-
-        # Clean up cached objects to prevent memory accumulation
-        prompt_cache_batches.clear()
 
         if not all_loss:
             # Handle edge case where no losses were computed

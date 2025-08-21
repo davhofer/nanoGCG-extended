@@ -918,6 +918,9 @@ class GCG:
         optim_ids_onehot_grad = torch.autograd.grad(
             outputs=[avg_loss], inputs=[optim_ids_onehot]
         )[0]
+        
+        # Normalize gradients per token position (matching llm-attacks and better_opts_attacks)
+        optim_ids_onehot_grad = optim_ids_onehot_grad / optim_ids_onehot_grad.norm(dim=-1, keepdim=True)
 
         optim_ids_onehot.grad = None
         del optim_ids_onehot
@@ -1048,6 +1051,9 @@ class GCG:
         optim_ids_onehot_grad = torch.autograd.grad(
             outputs=[avg_loss], inputs=[optim_ids_onehot]
         )[0]
+        
+        # Normalize gradients per token position (matching llm-attacks and better_opts_attacks)
+        optim_ids_onehot_grad = optim_ids_onehot_grad / optim_ids_onehot_grad.norm(dim=-1, keepdim=True)
 
         optim_ids_onehot.grad = None
         del optim_ids_onehot

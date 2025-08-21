@@ -553,7 +553,6 @@ class GCG:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=False,
             )
             # Remove the BOS token -- this will get added when tokenizing, if necessary
             if tokenizer.bos_token and template.startswith(tokenizer.bos_token):

@@ -553,6 +553,7 @@ class GCG:
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
+                enable_thinking=False,
             )
             # Remove the BOS token -- this will get added when tokenizing, if necessary
             if tokenizer.bos_token and template.startswith(tokenizer.bos_token):
@@ -1178,9 +1179,10 @@ class GCG:
                 # Create input embeddings with the current adversarial string
                 input_embeds = torch.cat(
                     [
-                        self.embedding_layer(prompt_data["input_ids"]),
+                        prompt_data["before_embeds"],
                         self.embedding_layer(optim_ids),
-                        self.embedding_layer(prompt_data["target_slice"]),
+                        prompt_data["after_embeds"],
+                        prompt_data["target_embeds"],
                     ],
                     dim=1,
                 )
@@ -1190,7 +1192,12 @@ class GCG:
                 logits = outputs.logits
                 
                 # Get the part of logits corresponding to the target
-                shift_logits = logits[..., prompt_data["target_slice"].shape[1] - 1 : -1, :].contiguous()
+                # The logits are shifted by 1 (each logit predicts the next token)
+                # We need logits starting from where the target begins
+                # Target begins after: before_embeds + optim_ids + after_embeds
+                target_start_idx = prompt_data["before_embeds"].shape[1] + optim_ids.shape[0] + prompt_data["after_embeds"].shape[1] - 1
+                target_end_idx = target_start_idx + prompt_data["target_ids"].shape[1]
+                shift_logits = logits[..., target_start_idx:target_end_idx, :].contiguous()
                 shift_labels = prompt_data["target_ids"].contiguous()
                 
                 # Check if argmax matches target exactly

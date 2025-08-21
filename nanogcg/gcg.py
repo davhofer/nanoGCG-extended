@@ -115,6 +115,7 @@ class GCGResult:
     best_string: str
     losses: List[float]
     strings: List[str]
+    match_fraction_at_best: float  # Fraction of exact matches when best string was found
 
 
 class AttackBuffer:
@@ -311,6 +312,8 @@ class GCG:
         self, config, buffer, optim_ids, losses, optim_strings, tokenizer, prof=None
     ):
         """Run the main GCG optimization loop."""
+        # Track match fractions for each step
+        match_fractions = []
         for step in tqdm(range(config.num_steps)):
             # Compute the token gradient across all prompts
             optim_ids_onehot_grad = self.compute_token_gradient(optim_ids)
@@ -356,6 +359,10 @@ class GCG:
             optim_ids = buffer.get_best_ids()
             optim_str = tokenizer.batch_decode(optim_ids)[0]
             optim_strings.append(optim_str)
+            
+            # Calculate match fraction for current best string
+            current_match_fraction = self._calculate_match_fraction(optim_ids)
+            match_fractions.append(current_match_fraction)
 
             buffer.log_buffer(tokenizer)
 
@@ -368,6 +375,9 @@ class GCG:
                     f"Early stopping triggered  (Config: {self.config.early_stop})"
                 )
                 break
+        
+        # Return match fractions for use in result creation
+        return match_fractions
 
     def run(
         self,
@@ -465,7 +475,7 @@ class GCG:
             prof = self._setup_profiler(config.profiling)
             prof.start()
             try:
-                self._optimization_loop(
+                match_fractions = self._optimization_loop(
                     config,
                     buffer,
                     optim_ids,
@@ -477,7 +487,7 @@ class GCG:
             finally:
                 prof.stop()
         else:
-            self._optimization_loop(
+            match_fractions = self._optimization_loop(
                 config, buffer, optim_ids, losses, optim_strings, tokenizer
             )
 
@@ -488,6 +498,7 @@ class GCG:
             best_string=optim_strings[min_loss_index],
             losses=losses,
             strings=optim_strings,
+            match_fraction_at_best=match_fractions[min_loss_index] if match_fractions else 0.0,
         )
 
         return result
@@ -887,6 +898,40 @@ class GCG:
                 should_stop = fraction_low_loss >= self.config.early_stop.fraction
 
         return should_stop
+    
+    def _calculate_match_fraction(self, optim_ids: Tensor) -> float:
+        """Calculate the fraction of prompts that produce exact target matches with current optim_ids."""
+        match_count = 0
+        total_prompts = len(self.prompt_data)
+        
+        with torch.no_grad():
+            for prompt_data in self.prompt_data:
+                # Create input embeddings with the current adversarial string
+                input_embeds = torch.cat(
+                    [
+                        self.embedding_layer(prompt_data["input_ids"]),
+                        self.embedding_layer(optim_ids),
+                        self.embedding_layer(prompt_data["target_slice"]),
+                    ],
+                    dim=1,
+                )
+                
+                # Forward pass to get logits
+                outputs = self.model(inputs_embeds=input_embeds)
+                logits = outputs.logits
+                
+                # Get the part of logits corresponding to the target
+                shift_logits = logits[..., prompt_data["target_slice"].shape[1] - 1 : -1, :].contiguous()
+                shift_labels = prompt_data["target_ids"].contiguous()
+                
+                # Check if argmax matches target exactly
+                predicted_tokens = torch.argmax(shift_logits, dim=-1)
+                exact_match = torch.all(predicted_tokens == shift_labels, dim=-1).item()
+                
+                if exact_match:
+                    match_count += 1
+        
+        return match_count / total_prompts if total_prompts > 0 else 0.0
 
     def _compute_candidates_loss(
         self,
